@@ -1,0 +1,190 @@
+Transmitter Code:
+#include <Wire.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+#define VIB_PIN A0
+#define TEMP_THRESHOLD 100
+#define VIB_THRESHOLD 1000
+#define ANGLE_THRESHOLD 20
+
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial (4, 3); // GPS RX, TX
+
+unsigned long lastCheck = 0;
+const unsigned long interval = 1000;
+bool accidentDetected = false; // Flag to stop sensor readings
+
+float lastKnownAngle = 0.0;
+float lastKnownVibration = 0.0;
+float lastKnownTemperature = 0.0;
+
+void setup () {
+  Serial.begin(9600);
+  gpsSerial.begin(9600);
+
+  Serial.println("Initializing MPU6050...");
+  if (! mpu. begin ()) {
+    Serial.println("Failed to find MPU6050 chip. Check wiring!");
+    while (1);
+  }
+  Serial.println("MPU6050 Initialized.");
+
+  Serial.println("Initializing LoRa...");
+  if (! LoRa.begin(433E6)) {
+    Serial.println("LoRa init failed. Check your connections.");
+    while (1);
+  }
+  Serial.println("LoRa Initialized at 433 MHz.");
+
+  pinMode (VIB_PIN, INPUT);
+  Serial.println("Setup Complete.\n");
+}
+
+void loop () {
+  // Read GPS data
+  while (gpsSerial.available()) {
+    gps. encode (gpsSerial.read());
+  }
+
+  // Only check sensors if accident hasn't been detected
+  if (! accidentDetected && millis () - lastCheck >= interval) {
+    lastCheck = millis ();
+
+    // Read MPU6050 sensor values
+    sensors_event_t a, g, temp;
+    mpu. getEvent (&a, &g, &temp);
+
+    float angle = abs (atan2(a.acceleration.y, a.acceleration.z) * 180 / PI);
+    float vibration = analogRead(VIB_PIN);
+    float temperature = temp. temperature;
+
+    Serial.println("---- Sensor Readings ----");
+    Serial. Print ("Angle: ");
+    Serial.println(angle);
+    Serial. Print ("Vibration: ");
+    Serial.println(vibration);
+    Serial.print("Temperature: ");
+    Serial.println(temperature);
+
+    // Accident detection logic
+    bool accident = (angle > ANGLE_THRESHOLD) || 
+                    (vibration > VIB_THRESHOLD) || 
+                    (temperature > TEMP_THRESHOLD);
+
+    if (accident) {
+      Serial.println("!! Accident Detected !!");
+
+      // Store the sensor values for transmission after accident detection
+      lastKnownAngle = angle;
+      lastKnownVibration = vibration;
+      lastKnownTemperature = temperature;
+
+      // Stop sensor checks after accident detection
+      accidentDetected = true;
+
+      if (gps. location. isValid ()) {
+        String alert = "ALERT\nLat:" + String (gps.location.lat (), 6) +
+                       "\nLon:" + String (gps.location.lng (), 6) +
+                       "\nTemp:" + String(lastKnownTemperature) +
+                       "\nAngle:" + String(lastKnownAngle) +
+                       "\nVibration:" + String(lastKnownVibration);
+
+        Serial.println("Sending LoRa Packet...");
+        Serial.println(alert);
+
+        LoRa.beginPacket();
+        LoRa.print(alert);
+        LoRa.endPacket();
+
+        Serial.println("Packet Sent.\n");
+      } else {
+        Serial.println("GPS location invalid. Cannot send alert.\n");
+      }
+    } else {
+      Serial.println("No accident detected.\n");
+    }
+  }
+
+  // After accident is detected, keep transmitting GPS, angle, and vibration values via LoRa
+  if (accidentDetected && gps.location.isValid()) {
+    String alert = "ACCIDENT ALERT\n";
+    alert += "Lat: " + String(gps.location.lat(), 6);
+    alert += "\nLon: " + String(gps.location.lng(), 6);
+    alert += "\nAngle: " + String(lastKnownAngle);
+    alert += "\nVibration: " + String(lastKnownVibration);
+
+    Serial.println("Sending LoRa Packet after accident detection...");
+    Serial.println(alert);
+
+    LoRa.beginPacket();
+    LoRa.print(alert);
+    LoRa.endPacket();
+
+    Serial.println("Packet Sent.\n");
+
+    delay(5000); // Delay to avoid spamming the LoRa network
+  }
+}
+
+Receiving Code:
+
+#include <LoRa.h>
+#include <SoftwareSerial.h>
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+
+char auth [] = "YourBlynkToken";
+char ssid [] = "YourWiFiSSID";
+char pass [] = "YourWiFiPassword";
+
+SoftwareSerial sim800(D5, D6); // RX, TX for GSM
+String lastMessage = "";
+
+BlynkTimer timer;
+
+void setup () {
+  Serial.begin(9600);
+  sim800.begin(9600);
+  Blynk.begin(auth, ssid, pass);
+
+  LoRa.begin(433E6); // Set LoRa frequency to 433 MHz
+  timer.setInterval (1000L, checkLoRa); // Check LoRa every second
+}
+
+void loop () {
+  Blynk.run (); // Handle Blynk tasks
+  timer.run (); // Execute timed tasks
+}
+
+void checkLoRa() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String msg = "";
+    while (LoRa.available()) {
+      msg += (char)LoRa.read();
+    }
+
+    Serial.println("Received: " + msg);
+    Blynk.virtualWrite(V0, "YES"); // Set virtual pin V0 to "YES"
+    Blynk.virtualWrite(V1, msg); // Display received message on Blynk
+
+    sendSMS(msg); // Send the received message via SMS
+  }
+}
+
+void sendSMS (String text) {
+  sim800.println("AT+CMGF=1"); // Set SMS format to text mode
+  delay (1000);
+  sim800.println("AT+CMGS=\"+91xxxxxxxxxx\""); // Replace with the recipient's phone number
+  delay (1000);
+  sim800.println("⚠️ Accident Alert! \n" + text); // SMS body
+  sim800.write(26); // Send the message (CTRL+Z)
+  delay (2000); // Wait for SMS to be sent
+}
+
